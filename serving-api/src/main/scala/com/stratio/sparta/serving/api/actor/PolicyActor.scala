@@ -18,12 +18,17 @@ package com.stratio.sparta.serving.api.actor
 import java.io.File
 import java.util.UUID
 
+import scala.concurrent.Await
+
 import akka.actor.{Actor, ActorRef}
 import akka.event.slf4j.SLF4JLogging
+import akka.util.Timeout
 import com.stratio.sparta.driver.util.HdfsUtils
 import com.stratio.sparta.serving.api.constants.ActorsConstant
+import com.stratio.sparta.serving.api.utils.ResourceManagerLink
+import com.stratio.sparta.serving.core.policy.status.PolicyStatusActor.Response
 import com.stratio.sparta.serving.core.{CuratorFactoryHolder, SpartaConfig}
-import com.stratio.sparta.serving.core.constants.AppConstant
+import com.stratio.sparta.serving.core.constants.{AkkaConstant, AppConstant}
 import com.stratio.sparta.serving.core.dao.ConfigDAO
 import com.stratio.sparta.serving.core.exception.ServingCoreException
 import com.stratio.sparta.serving.core.models._
@@ -37,6 +42,9 @@ import org.json4s.jackson.Serialization.{read, write}
 import scala.collection.JavaConversions
 import scala.util.{Failure, Success, Try}
 
+import scala.concurrent.duration._
+import akka.pattern.ask
+
 
 /**
  * Implementation of supported CRUD operations over ZK needed to manage policies.
@@ -46,6 +54,7 @@ class PolicyActor(curatorFramework: CuratorFramework, policyStatusActor: ActorRe
   with SpartaSerializer {
 
   import PolicyActor._
+
 
   override def receive: Receive = {
     case Create(policy) => create(policy)
@@ -57,14 +66,45 @@ class PolicyActor(curatorFramework: CuratorFramework, policyStatusActor: ActorRe
     case FindByFragment(fragmentType, id) => findByFragment(fragmentType, id)
   }
 
-  def findAll(): Unit =
-    sender ! ResponsePolicies(Try({
+  def findAll(): Unit = {
+    implicit val timeout: Timeout = Timeout(3.seconds)
+    sender ! ResponsePoliciesAndURL(Try({
       val children = curatorFramework.getChildren.forPath(s"${AppConstant.PoliciesBasePath}")
-      JavaConversions.asScalaBuffer(children).toList.map(element =>
+      val aggregationPolicyModels = JavaConversions.asScalaBuffer(children).toList.map(element =>
         byId(element)).toSeq
+      AggregationPolicyListModel(withStatus(aggregationPolicyModels), ResourceManagerLink.getLink)
     }).recover {
-      case e: NoNodeException => Seq()
+      case e: NoNodeException => AggregationPolicyListModel(Seq(), ResourceManagerLink.getLink)
     })
+  }
+
+  private def withStatus(policies: Seq[AggregationPoliciesModel]): Seq[PolicyWithStatus] = {
+    if (!policies.isEmpty) {
+      implicit val timeout: Timeout = Timeout(3.seconds)
+      val future = policyStatusActor ? PolicyStatusActor.FindAll
+      Await.result(future, timeout.duration) match {
+        case PolicyStatusActor.Response(Failure(exception)) => throw exception
+        case PolicyStatusActor.Response(Success(policyStatuses)) => {
+          for {
+            policy <- policies
+          } yield {
+            getPolicyWithStatus(policy, policyStatuses)
+          }
+        }
+      }
+    } else {
+      Seq()
+    }
+  }
+
+  private def getPolicyWithStatus(policy: AggregationPoliciesModel, statuses: Seq[PolicyStatusModel])
+  : PolicyWithStatus = {
+    val status = statuses.find(_.id == policy.id.get) match {
+      case Some(statusPolicy) => statusPolicy.status
+      case None => PolicyStatusEnum.NotStarted
+    }
+    PolicyWithStatus(status, policy)
+  }
 
   def findByFragment(fragmentType: String, id: String): Unit =
     sender ! ResponsePolicies(Try({
@@ -127,7 +167,7 @@ class PolicyActor(curatorFramework: CuratorFramework, policyStatusActor: ActorRe
     }))
 
   def update(policy: AggregationPoliciesModel): Unit = {
-    sender ! Response(Try({
+    sender ! PolicyActor.Response(Try({
       val searchPolicy = existsByNameId(policy.name, policy.id)
       if (searchPolicy.isEmpty) {
         throw new ServingCoreException(ErrorModel.toString(
@@ -149,7 +189,7 @@ class PolicyActor(curatorFramework: CuratorFramework, policyStatusActor: ActorRe
   }
 
   def delete(id: String): Unit =
-    sender ! Response(Try({
+    sender ! PolicyActor.Response(Try({
       val policyModel = byId(id)
       Try {
         if (SpartaConfig.getDetailConfig.get.getString(AppConstant.ExecutionMode) == "local") {
@@ -217,6 +257,8 @@ object PolicyActor extends SLF4JLogging {
   case class Response(status: Try[_])
 
   case class ResponsePolicies(policies: Try[Seq[AggregationPoliciesModel]])
+
+  case class ResponsePoliciesAndURL(policies: Try[AggregationPolicyListModel])
 
   case class ResponsePolicy(policy: Try[AggregationPoliciesModel])
 

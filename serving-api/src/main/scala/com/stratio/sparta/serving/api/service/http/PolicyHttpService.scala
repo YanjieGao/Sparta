@@ -155,8 +155,8 @@ trait PolicyHttpService extends BaseHttpService with SpartaSerializer {
         complete {
           val future = supervisor ? new FindAll()
           Await.result(future, timeout.duration) match {
-            case ResponsePolicies(Failure(exception)) => throw exception
-            case ResponsePolicies(Success(policies)) => withStatus(policies)
+            case ResponsePoliciesAndURL(Failure(exception)) => throw exception
+            case ResponsePoliciesAndURL(Success(policies)) => policies
           }
         }
       }
